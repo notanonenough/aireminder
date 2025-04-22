@@ -56,6 +56,7 @@ if not BOT_TOKEN or not YC_FOLDER_ID or not YC_SECRET_ID:
     logger.error("Не указаны обязательные переменные окружения")
     raise EnvironmentError("Отсутствуют обязательные переменные окружения")
 
+
 class ReminderBot:
     """Бот для управления напоминаниями с использованием LLM."""
 
@@ -68,7 +69,7 @@ class ReminderBot:
         self.db_tasks_listing_page = 0
         self.bot = Bot(token=BOT_TOKEN)
         # Добавляем кэш для часто запрашиваемых данных (TTL = 5 минут)
-        self.user_cache = TTLCache(maxsize=100, ttl=300)
+        self.chat_cache = TTLCache(maxsize=100, ttl=300)
         self.last_log_position = 0  # Для оптимизации чтения лога
         logger.info("ReminderBot initialized")
 
@@ -83,51 +84,54 @@ class ReminderBot:
         """
         return user.get("is_admin", False) or user.get("telegram_id", 0) == ADMIN_ID
 
-    def is_tg_user_allowed(self, tg_user: telegram.User) -> bool:
-        """Проверяет, разрешено ли пользователю использовать бота.
+    def is_chat_allowed(self, chat_id: int, user_id: int = None) -> bool:
+        """Проверяет, разрешено ли чату использовать бота.
 
         Args:
-            tg_user: Объект пользователя Telegram
+            chat_id: ID чата
+            user_id: ID пользователя (для приватных чатов)
 
         Returns:
-            True, если пользователю разрешен доступ, иначе False
+            True, если чату разрешен доступ, иначе False
         """
         # Сначала проверяем кэш
-        cache_key = f"user_{tg_user.id}"
-        if cache_key in self.user_cache:
-            return self.user_cache[cache_key]
+        cache_key = f"chat_{chat_id}"
+        if cache_key in self.chat_cache:
+            return self.chat_cache[cache_key]
 
-        user = self.db.get_user(tg_user.id)
+        chat = self.db.get_chat(chat_id)
 
-        # Регистрация пользователя, если он новый
-        if user is None:
-            logger.info(f"Регистрация нового пользователя: {tg_user.id} ({tg_user.full_name})")
-            self.db.create_user({
-                'telegram_id': tg_user.id,
-                'full_name': tg_user.full_name,
-                'username': tg_user.username
+        # Регистрация чата, если он новый
+        if chat is None:
+            logger.info(f"Регистрация нового чата: {chat_id}")
+            # Если это приватный чат, его ID совпадает с ID пользователя
+            is_group = chat_id < 0  # В Telegram ID групп отрицательные
+            self.db.create_chat({
+                'chat_id': chat_id,
+                'is_group': is_group,
+                'is_allowed': chat_id in ALLOWED_USERS or (user_id and user_id in ALLOWED_USERS)
             })
-            user = self.db.get_user(tg_user.id)
+            chat = self.db.get_chat(chat_id)
 
-        is_allowed = user is not None and (user.get("is_allowed", False) or tg_user.id in ALLOWED_USERS)
+        is_allowed = chat is not None and (chat.get("is_allowed", False) or chat_id in ALLOWED_USERS)
         # Сохраняем результат в кэше
-        self.user_cache[cache_key] = is_allowed
+        self.chat_cache[cache_key] = is_allowed
 
         return is_allowed
 
-    def select_nearest_time_for_tag(self, user_id: int, tag_name: str) -> datetime:
+    def select_nearest_time_for_tag(self, chat_id: int, tag_name: str) -> datetime:
         """Вычисляет оптимальное время для нового напоминания.
 
         Args:
-            user_id: ID пользователя
+            chat_id: ID чата
             tag_name: Название тега
 
         Returns:
             Рекомендуемое время для нового напоминания
         """
-        for tag in self.db.get_user_tags(user_id):
+        for tag in self.db.get_chat_tags(chat_id):
             if tag["name"] == tag_name:
-                tasks = self.db.list_reminders_by_tag(user_id, tag["id"])
+                tasks = self.db.list_reminders_by_tag(chat_id, tag["id"])
                 tasks_timestamps = [parse_timestamp(task["due_time"]) for task in tasks]
                 tasks_timestamps.sort()
 
@@ -147,8 +151,10 @@ class ReminderBot:
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка доступа от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка доступа от неразрешенного чата: {chat_id}")
             await update.message.reply_text(
                 "Извините, у вас нет доступа к этому боту. Обратитесь к администратору."
             )
@@ -163,10 +169,10 @@ class ReminderBot:
 
         try:
             await update.message.reply_text(
-                "Добро пожаловать! Выберите действие:",
+                f"Добро пожаловать! Этот бот поможет {'вашей группе' if chat_id < 0 else 'вам'} управлять напоминаниями. Выберите действие:",
                 reply_markup=reply_markup
             )
-            logger.info(f"Пользователь {user.id} запустил бота")
+            logger.info(f"Чат {chat_id} запустил бота")
         except Exception as e:
             logger.error(f"Ошибка при отправке приветствия: {e}")
 
@@ -284,8 +290,10 @@ class ReminderBot:
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Сообщение от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Сообщение от неразрешенного чата: {chat_id}")
             return
 
         # Проверяем, не слишком ли короткое сообщение
@@ -297,10 +305,10 @@ class ReminderBot:
             return
 
         # Отправляем индикатор печати
-        await self.bot.send_chat_action(chat_id=user.id, action=telegram.constants.ChatAction.TYPING)
+        await self.bot.send_chat_action(chat_id=chat_id, action=telegram.constants.ChatAction.TYPING)
 
-        # Получаем теги пользователя
-        tags = self.db.get_user_tags(user.id) + [{"name": "default", "start_time": "00:00", "end_time": "23:59"}]
+        # Получаем теги чата
+        tags = self.db.get_chat_tags(chat_id) + [{"name": "default", "start_time": "00:00", "end_time": "23:59"}]
 
         try:
             # Извлекаем задачи из сообщения
@@ -318,7 +326,8 @@ class ReminderBot:
                     due_time = parse_datetime(task["time"])
                     if due_time:
                         self.db.create_unconfirmed_reminder(
-                            user_id=user.id,
+                            chat_id=chat_id,
+                            created_by=user.id,
                             text=task['text'],
                             tag_id=tag,
                             due_time=due_time
@@ -329,13 +338,14 @@ class ReminderBot:
 
             # Формируем клавиатуру для подтверждения задач
             keyboard = []
-            unconfirmed_reminders = self.db.list_unconfirmed_reminders(user.id)
+            unconfirmed_reminders = self.db.list_unconfirmed_reminders(chat_id)
 
             # Группируем задачи по дате для более удобного отображения
             grouped_tasks = self._group_unconfirmed_tasks_by_date(unconfirmed_reminders)
 
             for date_group, tasks in grouped_tasks.items():
-                keyboard.append([InlineKeyboardButton(f"📅 {date_group}", callback_data="ignore")])  # Use ignore to bypass
+                keyboard.append(
+                    [InlineKeyboardButton(f"📅 {date_group}", callback_data="ignore")])  # Use ignore to bypass
 
                 for task in tasks:
                     due_time = parse_timestamp(task['due_time'])
@@ -354,14 +364,16 @@ class ReminderBot:
                 )
             else:
                 await update.message.reply_text(
-                    "Не удалось создать напоминания из вашего сообщения. Попробуйте перефразировать.")
+                    "Не удалось создать напоминания из вашего сообщения. Попробуйте перефразировать."
+                )
 
-            logger.info(f"Создано {created_count} неподтвержденных напоминаний для пользователя {user.id}")
+            logger.info(f"Создано {created_count} неподтвержденных напоминаний для чата {chat_id}")
 
         except Exception as e:
             logger.error(f"Ошибка при обработке сообщения: {e}\n{traceback.format_exc()}")
             await update.message.reply_text(
-                "Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте еще раз.")
+                "Произошла ошибка при обработке вашего запроса. Пожалуйста, попробуйте еще раз."
+            )
 
     def _group_unconfirmed_tasks_by_date(self, tasks: List[Dict]) -> Dict[str, List[Dict]]:
         """Группирует неподтвержденные задачи по дате.
@@ -401,8 +413,10 @@ class ReminderBot:
     async def confirm_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Обрабатывает подтверждение задачи пользователем."""
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка подтверждения задачи от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка подтверждения задачи от неразрешенного чата: {chat_id}")
             return
 
         query = update.callback_query
@@ -416,8 +430,8 @@ class ReminderBot:
 
         try:
             if unconfirmed_task_id == "remove":
-                deleted_count = self.db.delete_unconfirmed_reminders(query.from_user.id)
-                logger.info(f"Удалено {deleted_count} неподтвержденных напоминаний для пользователя {user.id}")
+                deleted_count = self.db.delete_unconfirmed_reminders(chat_id)
+                logger.info(f"Удалено {deleted_count} неподтвержденных напоминаний для чата {chat_id}")
                 await self.bot.answer_callback_query(query.id, text=f"Отменено {deleted_count} напоминаний")
 
                 # Обновляем сообщение, чтобы удалить кнопки
@@ -433,7 +447,8 @@ class ReminderBot:
 
             # Сохранение в БД
             reminder_id = self.db.create_reminder(
-                user_id=query.from_user.id,
+                chat_id=chat_id,
+                created_by=user.id,
                 text=task_data['text'],
                 tag_id=task_data['tag_id'],
                 due_time=parse_timestamp(task_data['due_time'])
@@ -464,12 +479,12 @@ class ReminderBot:
                         logger.error(f"Не удалось обновить клавиатуру: {e}")
 
                 await self.bot.send_message(
-                    query.from_user.id,
+                    chat_id,
                     f"✅ Задача «{task_data['text']}» добавлена на {short_format_datetime(parse_timestamp(task_data['due_time']))}!"
                 )
-                logger.info(f"Пользователь {user.id} подтвердил задачу '{task_data['text']}'")
+                logger.info(f"Пользователь {user.id} подтвердил задачу '{task_data['text']}' в чате {chat_id}")
             else:
-                await self.bot.send_message(query.from_user.id, "❌ Не удалось сохранить задачу")
+                await self.bot.send_message(chat_id, "❌ Не удалось сохранить задачу")
 
             await self.bot.answer_callback_query(query.id)
 
@@ -480,8 +495,10 @@ class ReminderBot:
     async def ignore(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Обрабатывает нулевой колбэк."""
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка нулевого колбэка от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка нулевого колбэка от неразрешенного чата: {chat_id}")
             return
 
         query = update.callback_query
@@ -501,8 +518,10 @@ class ReminderBot:
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка переноса задачи от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка переноса задачи от неразрешенного чата: {chat_id}")
             return
 
         query = update.callback_query
@@ -538,12 +557,13 @@ class ReminderBot:
                         logger.error(f"Не удалось обновить сообщение: {e}")
 
                 await self.bot.send_message(
-                    query.from_user.id,
+                    chat_id,
                     f"⏰ Задача «{task_data['text']}» перенесена на {short_format_datetime(new_due_dt)}!"
                 )
-                logger.info(f"Пользователь {user.id} перенес задачу '{task_data['text']}' на {new_due_dt}")
+                logger.info(
+                    f"Пользователь {user.id} перенес задачу '{task_data['text']}' на {new_due_dt} в чате {chat_id}")
             else:
-                await self.bot.send_message(query.from_user.id, "❌ Не удалось перенести задачу")
+                await self.bot.send_message(chat_id, "❌ Не удалось перенести задачу")
 
             await self.bot.answer_callback_query(query.id)
 
@@ -599,22 +619,22 @@ class ReminderBot:
             reminders = self.db.get_due_reminders(dt)
             logger.info(f"Проверка напоминаний: найдено {len(reminders)} активных напоминаний")
 
-            # Группируем напоминания по пользователям для оптимизации
-            user_reminders = {}
+            # Группируем напоминания по чатам для оптимизации
+            chat_reminders = {}
             for reminder in reminders:
-                user_id = reminder['user_id']
-                if user_id not in user_reminders:
-                    user_reminders[user_id] = []
-                user_reminders[user_id].append(reminder)
+                chat_id = reminder['chat_id']
+                if chat_id not in chat_reminders:
+                    chat_reminders[chat_id] = []
+                chat_reminders[chat_id].append(reminder)
 
-            for user_id, user_reminder_list in user_reminders.items():
+            for chat_id, chat_reminder_list in chat_reminders.items():
                 try:
-                    user = self.db.get_user(user_id)
-                    if not user:
-                        logger.error(f"Пользователь {user_id} не найден")
+                    chat = self.db.get_chat(chat_id)
+                    if not chat:
+                        logger.error(f"Чат {chat_id} не найден")
                         continue
 
-                    for reminder in user_reminder_list:
+                    for reminder in chat_reminder_list:
                         reminder_time = parse_timestamp(reminder["due_time"])
 
                         # Проверка, не отправляем напоминание раньше времени
@@ -634,22 +654,22 @@ class ReminderBot:
                             keyboard = self._create_reschedule_keyboard(reminder["id"])
                             reply_markup = InlineKeyboardMarkup(keyboard)
 
-                            # Отправка напоминания
+                            # Отправка напоминания в чат, где оно было создано
                             await self.bot.send_message(
-                                chat_id=user['telegram_id'],
+                                chat_id=chat_id,
                                 text=f"⏰ Напоминание: {reminder['text']}{assist}",
                                 reply_markup=reply_markup
                             )
 
                             # Отмечаем напоминание как отправленное
                             self.db.mark_reminder_completed(reminder['id'])
-                            logger.info(f"Отправлено напоминание {reminder['id']} пользователю {user['telegram_id']}")
+                            logger.info(f"Отправлено напоминание {reminder['id']} в чат {chat_id}")
 
                         except Exception as e:
                             logger.error(f"Ошибка при отправке напоминания {reminder['id']}: {e}")
 
                 except Exception as e:
-                    logger.error(f"Ошибка при обработке напоминаний пользователя {user_id}: {e}")
+                    logger.error(f"Ошибка при обработке напоминаний чата {chat_id}: {e}")
 
         except Exception as e:
             logger.error(f"Ошибка при проверке напоминаний: {e}")
@@ -692,8 +712,10 @@ class ReminderBot:
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка отметки задачи от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка отметки задачи от неразрешенного чата: {chat_id}")
             return
 
         query = update.callback_query
@@ -716,7 +738,8 @@ class ReminderBot:
                         logger.error(f"Не удалось обновить сообщение: {e}")
 
                 await self.bot.answer_callback_query(query.id, text="Задача отмечена как выполненная")
-                logger.info(f"Пользователь {user.id} отметил задачу '{task_data['text']}' как выполненную")
+                logger.info(
+                    f"Пользователь {user.id} отметил задачу '{task_data['text']}' как выполненную в чате {chat_id}")
             else:
                 await self.bot.answer_callback_query(query.id, text="Не удалось обновить статус задачи")
 
@@ -813,28 +836,28 @@ class ReminderBot:
 
         try:
             reminders = self.db.get_due_reminders(dt)
-            reminders_per_user = {}
+            reminders_per_chat = {}
 
-            # Группируем напоминания по пользователям
+            # Группируем напоминания по чатам
             for reminder in reminders:
-                user_id = reminder["user_id"]
-                if user_id not in reminders_per_user:
-                    reminders_per_user[user_id] = []
-                reminders_per_user[user_id].append(reminder)
+                chat_id = reminder["chat_id"]
+                if chat_id not in reminders_per_chat:
+                    reminders_per_chat[chat_id] = []
+                reminders_per_chat[chat_id].append(reminder)
 
-            # Отправляем сообщения каждому пользователю
-            for user_id, user_reminders in reminders_per_user.items():
-                if not user_reminders:
+            # Отправляем сообщения в каждый чат
+            for chat_id, chat_reminders in reminders_per_chat.items():
+                if not chat_reminders:
                     continue
 
-                user = self.db.get_user(user_id)
-                if not user:
-                    logger.warning(f"Пользователь {user_id} не найден для ежедневного уведомления")
+                chat = self.db.get_chat(chat_id)
+                if not chat:
+                    logger.warning(f"Чат {chat_id} не найден для ежедневного уведомления")
                     continue
 
                 # Группируем задачи по тегам для более наглядного отображения
                 tasks_by_tag = {}
-                for reminder in user_reminders:
+                for reminder in chat_reminders:
                     tag_id = reminder['tag_id']
                     if tag_id not in tasks_by_tag:
                         tasks_by_tag[tag_id] = []
@@ -852,8 +875,8 @@ class ReminderBot:
 
                 if len(tasks_text) > 1:  # Проверяем, что есть хотя бы один тег с задачами
                     message = "\n".join(tasks_text)
-                    await self.bot.send_message(chat_id=user['telegram_id'], text=message)
-                    logger.info(f"Отправлено ежедневное уведомление пользователю {user_id}")
+                    await self.bot.send_message(chat_id=chat_id, text=message)
+                    logger.info(f"Отправлено ежедневное уведомление в чат {chat_id}")
 
         except Exception as e:
             logger.error(f"Ошибка при отправке ежедневного уведомления: {e}")
@@ -920,12 +943,13 @@ class ReminderBot:
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка запуска мониторинга от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка запуска мониторинга от неразрешенного чата: {chat_id}")
             return
 
-        db_user = self.db.get_user(user.id)
-        if not self.user_is_admin(db_user):
+        if user.id != ADMIN_ID:
             logger.warning(f"Попытка запуска мониторинга от не-администратора: {user.id}")
             await update.message.reply_text("У вас нет прав для выполнения этой команды")
             return
@@ -946,12 +970,13 @@ class ReminderBot:
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка очистки лога от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка очистки лога от неразрешенного чата: {chat_id}")
             return
 
-        db_user = self.db.get_user(user.id)
-        if not self.user_is_admin(db_user):
+        if user.id != ADMIN_ID:
             logger.warning(f"Попытка очистки лога от не-администратора: {user.id}")
             await update.message.reply_text("У вас нет прав для выполнения этой команды")
             return
@@ -982,12 +1007,13 @@ class ReminderBot:
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка получения лога от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка получения лога от неразрешенного чата: {chat_id}")
             return
 
-        db_user = self.db.get_user(user.id)
-        if not self.user_is_admin(db_user):
+        if user.id != ADMIN_ID:
             logger.warning(f"Попытка получения лога от не-администратора: {user.id}")
             await update.message.reply_text("У вас нет прав для выполнения этой команды")
             return
@@ -1007,8 +1033,10 @@ class ReminderBot:
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка создания тега от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка создания тега от неразрешенного чата: {chat_id}")
             return
 
         try:
@@ -1028,9 +1056,9 @@ class ReminderBot:
                 await update.message.reply_text("❌ Неверный формат времени. Используйте HH:MM")
                 return
 
-            if self.db.create_tag(user.id, name, start_time, end_time):
+            if self.db.create_tag(chat_id, name, start_time, end_time):
                 await update.message.reply_text(f"✅ Тег '{name}' успешно создан!")
-                logger.info(f"Пользователь {user.id} создал тег '{name}'")
+                logger.info(f"Пользователь {user.id} создал тег '{name}' в чате {chat_id}")
             else:
                 await update.message.reply_text("❌ Ошибка при создании тега")
 
@@ -1039,19 +1067,20 @@ class ReminderBot:
             await update.message.reply_text("Произошла ошибка при создании тега")
 
     async def allow(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обрабатывает команду предоставления доступа пользователю.
+        """Обрабатывает команду предоставления доступа чату.
 
         Args:
             update: Объект обновления Telegram
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка предоставления доступа от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка предоставления доступа от неразрешенного чата: {chat_id}")
             return
 
-        db_user = self.db.get_user(user.id)
-        if not self.user_is_admin(db_user):
+        if user.id != ADMIN_ID:
             logger.warning(f"Попытка предоставления доступа от не-администратора: {user.id}")
             await update.message.reply_text("У вас нет прав для выполнения этой команды")
             return
@@ -1059,26 +1088,31 @@ class ReminderBot:
         try:
             args = context.args
             if len(args) != 1:
-                await update.message.reply_text("Использование: /allow <telegram_id>")
+                await update.message.reply_text("Использование: /allow <chat_id>")
                 return
 
-            telegram_id = args[0]
-            if not telegram_id.isdigit():
-                await update.message.reply_text("Telegram ID должен быть числом")
+            target_chat_id = args[0]
+            if not target_chat_id.lstrip('-').isdigit():
+                await update.message.reply_text("Chat ID должен быть числом (может быть отрицательным для групп)")
                 return
 
-            target_user = self.db.get_user(telegram_id)
-            if not target_user:
-                await update.message.reply_text(f"Пользователь с ID {telegram_id} не найден")
-                return
+            target_chat_id = int(target_chat_id)
+            target_chat = self.db.get_chat(target_chat_id)
+            if not target_chat:
+                self.db.create_chat({
+                    'chat_id': target_chat_id,
+                    'is_group': target_chat_id < 0,
+                    'is_allowed': True
+                })
+                target_chat = self.db.get_chat(target_chat_id)
 
-            if self.db.update_user_permission(telegram_id, True):
+            if self.db.update_chat_permission(target_chat_id, True):
                 # Обновляем кэш
-                cache_key = f"user_{telegram_id}"
-                self.user_cache[cache_key] = True
+                cache_key = f"chat_{target_chat_id}"
+                self.chat_cache[cache_key] = True
 
-                await update.message.reply_text(f"✅ Доступ пользователю '{telegram_id}' успешно предоставлен!")
-                logger.info(f"Пользователь {user.id} предоставил доступ пользователю {telegram_id}")
+                await update.message.reply_text(f"✅ Доступ чату '{target_chat_id}' успешно предоставлен!")
+                logger.info(f"Пользователь {user.id} предоставил доступ чату {target_chat_id}")
             else:
                 await update.message.reply_text("❌ Ошибка при предоставлении доступа")
 
@@ -1094,12 +1128,13 @@ class ReminderBot:
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка просмотра всех задач от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка просмотра всех задач от неразрешенного чата: {chat_id}")
             return
 
-        db_user = self.db.get_user(user.id)
-        if not self.user_is_admin(db_user):
+        if user.id != ADMIN_ID:
             logger.warning(f"Попытка просмотра всех задач от не-администратора: {user.id}")
             # Проверяем, откуда пришел запрос
             if update.callback_query:
@@ -1111,14 +1146,14 @@ class ReminderBot:
 
         try:
             all_tasks = []
-            users = self.db.list_users()
+            chats = self.db.list_chats()
 
-            for db_user in users:
-                tasks = self.db.list_uncompleted_reminders(db_user["telegram_id"])
+            for chat in chats:
+                tasks = self.db.list_uncompleted_reminders(chat["chat_id"])
                 for task in tasks:
                     task_info = {
                         "id": task["id"],
-                        "user": db_user["full_name"],
+                        "chat": f"{'Группа' if chat['is_group'] else 'Личный чат'} {chat['chat_id']}",
                         "text": task["text"],
                         "due_time": short_format_datetime(parse_timestamp(task["due_time"])),
                         "tag": task["tag_id"]
@@ -1151,7 +1186,7 @@ class ReminderBot:
                 f"📋 Все напоминания (стр. {self.db_tasks_listing_page + 1}/{(len(all_tasks) - 1) // page_size + 1}):"]
             for task in page_tasks:
                 response_lines.append(
-                    f"• {task['text']} ({task['due_time']}) [{task['tag']}] - {task['user']}"
+                    f"• {task['text']} ({task['due_time']}) [{task['tag']}] - {task['chat']}"
                 )
 
             response = "\n".join(response_lines)
@@ -1190,12 +1225,13 @@ class ReminderBot:
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка навигации по задачам от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка навигации по задачам от неразрешенного чата: {chat_id}")
             return
 
-        db_user = self.db.get_user(user.id)
-        if not self.user_is_admin(db_user):
+        if user.id != ADMIN_ID:
             logger.warning(f"Попытка навигации по задачам от не-администратора: {user.id}")
             await self.bot.answer_callback_query(update.callback_query.id, text="У вас нет прав для этой операции")
             return
@@ -1215,238 +1251,178 @@ class ReminderBot:
             logger.error(f"Ошибка при навигации по задачам: {e}")
             await self.bot.answer_callback_query(query.id, text="Произошла ошибка")
 
-    async def user_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обрабатывает команду просмотра списка пользователей.
+    async def chat_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обрабатывает команду просмотра списка чатов.
 
         Args:
             update: Объект обновления Telegram
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка просмотра списка пользователей от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка просмотра списка чатов от неразрешенного чата: {chat_id}")
             return
 
-        db_user = self.db.get_user(user.id)
-        if not self.user_is_admin(db_user):
-            logger.warning(f"Попытка просмотра списка пользователей от не-администратора: {user.id}")
+        if user.id != ADMIN_ID:
+            logger.warning(f"Попытка просмотра списка чатов от не-администратора: {user.id}")
             await update.message.reply_text("У вас нет прав для выполнения этой команды")
             return
 
         try:
             keyboard = []
-            users = self.db.list_users()
+            chats = self.db.list_chats()
 
-            if not users:
-                await update.message.reply_text("📋 Пользователи не найдены")
+            if not chats:
+                await update.message.reply_text("📋 Чаты не найдены")
                 return
 
-            for user_info in users:
-                status = "✅" if user_info["is_allowed"] else "🆕"
-                role = "👑" if user_info["is_admin"] else ""
-                text = f"{status} {user_info['full_name']} ({user_info['telegram_id']}) {role}"
-                callback_data = f"user_get:{user_info['telegram_id']}"
+            for chat_info in chats:
+                status = "✅" if chat_info["is_allowed"] else "🆕"
+                chat_type = "👥" if chat_info["is_group"] else "👤"
+                text = f"{status} {chat_type} ({chat_info['chat_id']})"
+                callback_data = f"chat_get:{chat_info['chat_id']}"
                 keyboard.append([InlineKeyboardButton(text, callback_data=callback_data)])
 
             reply_markup = InlineKeyboardMarkup(keyboard)
             await update.message.reply_text(
-                "👥 Выберите пользователя для подробностей:",
+                "👥 Выберите чат для подробностей:",
                 reply_markup=reply_markup
             )
-            logger.info(f"Пользователь {user.id} запросил список пользователей")
+            logger.info(f"Пользователь {user.id} запросил список чатов")
 
         except Exception as e:
-            logger.error(f"Ошибка при получении списка пользователей: {e}")
-            await update.message.reply_text("Произошла ошибка при получении списка пользователей")
+            logger.error(f"Ошибка при получении списка чатов: {e}")
+            await update.message.reply_text("Произошла ошибка при получении списка чатов")
 
-    async def user_get(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обрабатывает запрос на получение информации о пользователе.
+    async def chat_get(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обрабатывает запрос на получение информации о чате.
 
         Args:
             update: Объект обновления Telegram
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка получения информации о пользователе от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка получения информации о чате от неразрешенного чата: {chat_id}")
             return
 
-        db_user = self.db.get_user(user.id)
-        if not self.user_is_admin(db_user):
-            logger.warning(f"Попытка получения информации о пользователе от не-администратора: {user.id}")
+        if user.id != ADMIN_ID:
+            logger.warning(f"Попытка получения информации о чате от не-администратора: {user.id}")
             await self.bot.answer_callback_query(update.callback_query.id,
                                                  text="У вас нет прав для выполнения этой команды")
             return
 
         try:
             query = update.callback_query
-            telegram_id = query.data.split(":")[1]
+            target_chat_id = int(query.data.split(":")[1])
 
-            target_user = self.db.get_user(telegram_id)
-            if not target_user:
-                await self.bot.answer_callback_query(query.id, text="Пользователь не найден")
+            target_chat = self.db.get_chat(target_chat_id)
+            if not target_chat:
+                await self.bot.answer_callback_query(query.id, text="Чат не найден")
                 return
 
-            # Форматируем информацию о пользователе
-            user_info = (
-                f"👤 Информация о пользователе:\n\n"
-                f"ID: {target_user['telegram_id']}\n"
-                f"Имя: {target_user['full_name']}\n"
-                f"Username: {target_user.get('username', 'Не указан')}\n"
-                f"Статус: {'Активен' if target_user['is_allowed'] else 'Не активирован'}\n"
-                f"Роль: {'Администратор' if target_user['is_admin'] else 'Пользователь'}\n"
+            # Форматируем информацию о чате
+            chat_info = (
+                f"ℹ️ Информация о чате:\n\n"
+                f"ID: {target_chat['chat_id']}\n"
+                f"Тип: {'Группа' if target_chat['is_group'] else 'Личный чат'}\n"
+                f"Статус: {'Активен' if target_chat['is_allowed'] else 'Не активирован'}\n"
             )
 
             # Добавляем статистику задач
-            tasks = self.db.list_uncompleted_reminders(target_user['telegram_id'])
-            user_info += f"Активных задач: {len(tasks)}"
+            tasks = self.db.list_uncompleted_reminders(target_chat['chat_id'])
+            chat_info += f"Активных задач: {len(tasks)}"
 
-            # Добавляем кнопки управления пользователем
+            # Добавляем кнопки управления чатом
             keyboard = []
-            if user.id != int(telegram_id) and (user.id == ADMIN_ID or not target_user['is_admin']):
-                action = "Заблокировать" if target_user['is_allowed'] else "Разблокировать"
-                callback_data = f"user_toggle:{telegram_id}"
-                keyboard.append([InlineKeyboardButton(action, callback_data=callback_data)])
-
-                if not target_user['is_admin']:
-                    keyboard.append(
-                        [InlineKeyboardButton("Сделать администратором", callback_data=f"user_admin:{telegram_id}")])
-                elif user.id == ADMIN_ID:
-                    keyboard.append(
-                        [InlineKeyboardButton("Снять права администратора", callback_data=f"user_admin:{telegram_id}")])
+            action = "Заблокировать" if target_chat['is_allowed'] else "Разблокировать"
+            callback_data = f"chat_toggle:{target_chat['chat_id']}"
+            keyboard.append([InlineKeyboardButton(action, callback_data=callback_data)])
 
             if keyboard:
                 reply_markup = InlineKeyboardMarkup(keyboard)
-                await self.bot.send_message(user.id, user_info, reply_markup=reply_markup)
+                await self.bot.send_message(user.id, chat_info, reply_markup=reply_markup)
             else:
-                await self.bot.send_message(user.id, user_info)
+                await self.bot.send_message(user.id, chat_info)
 
             await self.bot.answer_callback_query(query.id)
-            logger.info(f"Пользователь {user.id} запросил информацию о пользователе {telegram_id}")
+            logger.info(f"Пользователь {user.id} запросил информацию о чате {target_chat_id}")
 
         except Exception as e:
-            logger.error(f"Ошибка при получении информации о пользователе: {e}")
+            logger.error(f"Ошибка при получении информации о чате: {e}")
             await self.bot.answer_callback_query(update.callback_query.id, text="Произошла ошибка")
 
-    async def user_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обрабатывает запрос на изменение статуса пользователя.
+    async def chat_toggle(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обрабатывает запрос на изменение статуса чата.
 
         Args:
             update: Объект обновления Telegram
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка изменения статуса от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка изменения статуса чата от неразрешенного чата: {chat_id}")
             return
 
-        db_user = self.db.get_user(user.id)
-        if not self.user_is_admin(db_user):
-            logger.warning(f"Попытка изменения статуса от не-администратора: {user.id}")
+        if user.id != ADMIN_ID:
+            logger.warning(f"Попытка изменения статуса чата от не-администратора: {user.id}")
             await self.bot.answer_callback_query(update.callback_query.id, text="У вас нет прав для этого")
             return
 
         try:
             query = update.callback_query
-            telegram_id = query.data.split(":")[1]
+            target_chat_id = int(query.data.split(":")[1])
 
-            target_user = self.db.get_user(telegram_id)
-            if not target_user:
-                await self.bot.answer_callback_query(query.id, text="Пользователь не найден")
-                return
-
-            # Проверяем защиту от блокировки админов
-            if target_user['is_admin'] and user.id != ADMIN_ID:
-                await self.bot.answer_callback_query(query.id, text="Нельзя изменять статус администратора")
+            target_chat = self.db.get_chat(target_chat_id)
+            if not target_chat:
+                await self.bot.answer_callback_query(query.id, text="Чат не найден")
                 return
 
             # Инвертируем статус
-            new_status = not target_user['is_allowed']
+            new_status = not target_chat['is_allowed']
 
-            if self.db.update_user_permission(telegram_id, new_status):
+            if self.db.update_chat_permission(target_chat_id, new_status):
                 # Обновляем кэш
-                cache_key = f"user_{telegram_id}"
-                self.user_cache[cache_key] = new_status
+                cache_key = f"chat_{target_chat_id}"
+                self.chat_cache[cache_key] = new_status
 
                 action = "разблокирован" if new_status else "заблокирован"
-                await self.bot.answer_callback_query(query.id, text=f"Пользователь {action}")
+                await self.bot.answer_callback_query(query.id, text=f"Чат {action}")
 
-                # Обновляем информацию о пользователе
-                context.args = [telegram_id]
-                update.callback_query.data = f"user_get:{telegram_id}"
-                await self.user_get(update, context)
+                # Обновляем информацию о чате
+                context.args = [str(target_chat_id)]
+                update.callback_query.data = f"chat_get:{target_chat_id}"
+                await self.chat_get(update, context)
 
-                logger.info(f"Пользователь {user.id} изменил статус пользователя {telegram_id} на {new_status}")
+                logger.info(f"Пользователь {user.id} изменил статус чата {target_chat_id} на {new_status}")
             else:
                 await self.bot.answer_callback_query(query.id, text="Не удалось изменить статус")
 
         except Exception as e:
-            logger.error(f"Ошибка при изменении статуса пользователя: {e}")
-            await self.bot.answer_callback_query(update.callback_query.id, text="Произошла ошибка")
-
-    async def user_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обрабатывает запрос на изменение прав администратора.
-
-        Args:
-            update: Объект обновления Telegram
-            context: Контекст обработчика Telegram
-        """
-        user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка изменения прав от неразрешенного пользователя: {user.id}")
-            return
-
-        db_user = self.db.get_user(user.id)
-        if not self.user_is_admin(db_user) or user.id != ADMIN_ID:
-            logger.warning(f"Попытка изменения прав от не-администратора: {user.id}")
-            await self.bot.answer_callback_query(update.callback_query.id, text="У вас нет прав для этого")
-            return
-
-        try:
-            query = update.callback_query
-            telegram_id = query.data.split(":")[1]
-
-            target_user = self.db.get_user(telegram_id)
-            if not target_user:
-                await self.bot.answer_callback_query(query.id, text="Пользователь не найден")
-                return
-
-            # Инвертируем статус админа
-            new_admin_status = not target_user['is_admin']
-
-            # Здесь должен быть метод для обновления статуса админа, реализуйте его в Database
-            if self.db.update_user_admin_status(telegram_id, new_admin_status):
-                action = "получил права администратора" if new_admin_status else "лишен прав администратора"
-                await self.bot.answer_callback_query(query.id, text=f"Пользователь {action}")
-
-                # Обновляем информацию о пользователе
-                context.args = [telegram_id]
-                update.callback_query.data = f"user_get:{telegram_id}"
-                await self.user_get(update, context)
-
-                logger.info(
-                    f"Пользователь {user.id} изменил права администратора пользователя {telegram_id} на {new_admin_status}")
-            else:
-                await self.bot.answer_callback_query(query.id, text="Не удалось изменить права")
-
-        except Exception as e:
-            logger.error(f"Ошибка при изменении прав администратора: {e}")
+            logger.error(f"Ошибка при изменении статуса чата: {e}")
             await self.bot.answer_callback_query(update.callback_query.id, text="Произошла ошибка")
 
     async def disallow(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обрабатывает команду отзыва доступа у пользователя.
+        """Обрабатывает команду отзыва доступа у чата.
 
         Args:
             update: Объект обновления Telegram
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка отзыва доступа от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка отзыва доступа от неразрешенного чата: {chat_id}")
             return
 
-        db_user = self.db.get_user(user.id)
-        if not self.user_is_admin(db_user):
+        if user.id != ADMIN_ID:
             logger.warning(f"Попытка отзыва доступа от не-администратора: {user.id}")
             await update.message.reply_text("У вас нет прав для выполнения этой команды")
             return
@@ -1454,36 +1430,33 @@ class ReminderBot:
         try:
             args = context.args
             if len(args) != 1:
-                await update.message.reply_text("Использование: /ban <telegram_id>")
+                await update.message.reply_text("Использование: /ban <chat_id>")
                 return
 
-            telegram_id = args[0]
-            if not telegram_id.isdigit():
-                await update.message.reply_text("Telegram ID должен быть числом")
+            target_chat_id = args[0]
+            if not target_chat_id.lstrip('-').isdigit():
+                await update.message.reply_text("Chat ID должен быть числом (может быть отрицательным для групп)")
                 return
+
+            target_chat_id = int(target_chat_id)
 
             # Защита от самоблокировки
-            if int(telegram_id) == user.id:
-                await update.message.reply_text("❌ Нельзя отозвать доступ у самого себя")
+            if target_chat_id == chat_id:
+                await update.message.reply_text("❌ Нельзя отозвать доступ у текущего чата")
                 return
 
-            # Защита от блокировки администраторов
-            target_user = self.db.get_user(telegram_id)
-            if not target_user:
-                await update.message.reply_text(f"Пользователь с ID {telegram_id} не найден")
+            target_chat = self.db.get_chat(target_chat_id)
+            if not target_chat:
+                await update.message.reply_text(f"Чат с ID {target_chat_id} не найден")
                 return
 
-            if target_user.get("is_admin", False) and user.id != ADMIN_ID:
-                await update.message.reply_text("❌ Нельзя отозвать доступ у администратора")
-                return
-
-            if self.db.update_user_permission(telegram_id, False):
+            if self.db.update_chat_permission(target_chat_id, False):
                 # Обновляем кэш
-                cache_key = f"user_{telegram_id}"
-                self.user_cache[cache_key] = False
+                cache_key = f"chat_{target_chat_id}"
+                self.chat_cache[cache_key] = False
 
-                await update.message.reply_text(f"✅ Доступ у пользователя {telegram_id} успешно отозван!")
-                logger.info(f"Пользователь {user.id} отозвал доступ у пользователя {telegram_id}")
+                await update.message.reply_text(f"✅ Доступ у чата {target_chat_id} успешно отозван!")
+                logger.info(f"Пользователь {user.id} отозвал доступ у чата {target_chat_id}")
             else:
                 await update.message.reply_text("❌ Ошибка при отзыве доступа")
 
@@ -1492,19 +1465,21 @@ class ReminderBot:
             await update.message.reply_text("Произошла ошибка при отзыве доступа")
 
     async def list_tags(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обрабатывает запрос на просмотр тегов пользователя.
+        """Обрабатывает запрос на просмотр тегов чата.
 
         Args:
             update: Объект обновления Telegram
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка просмотра тегов от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка просмотра тегов от неразрешенного чата: {chat_id}")
             return
 
         try:
-            tags = self.db.get_user_tags(user.id)
+            tags = self.db.get_chat_tags(chat_id)
 
             if not tags:
                 # Добавляем кнопку для быстрого создания тегов
@@ -1512,7 +1487,7 @@ class ReminderBot:
                 reply_markup = InlineKeyboardMarkup(keyboard)
 
                 await self.bot.send_message(
-                    user.id,
+                    chat_id,
                     "📋 У вас пока нет тегов. Создайте первый тег командой /newtag имя_тега время_начала время_окончания",
                     reply_markup=reply_markup
                 )
@@ -1531,38 +1506,40 @@ class ReminderBot:
             keyboard.append([InlineKeyboardButton("➕ Создать тег", callback_data="create_tag")])
 
             reply_markup = InlineKeyboardMarkup(keyboard)
-            await self.bot.send_message(user.id, "🏷 Ваши теги:", reply_markup=reply_markup)
+            await self.bot.send_message(chat_id, "🏷 Ваши теги:", reply_markup=reply_markup)
 
             if update.callback_query:
                 await self.bot.answer_callback_query(update.callback_query.id)
 
-            logger.info(f"Пользователь {user.id} просмотрел свои теги")
+            logger.info(f"Чат {chat_id} просмотрел свои теги")
 
         except Exception as e:
             logger.error(f"Ошибка при просмотре тегов: {e}")
             error_message = "Произошла ошибка при получении списка тегов"
 
-            await self.bot.send_message(user.id, error_message)
+            await self.bot.send_message(chat_id, error_message)
             if update.callback_query:
                 await self.bot.answer_callback_query(update.callback_query.id, text="Произошла ошибка")
 
     async def list_tasks(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обрабатывает запрос на просмотр напоминаний пользователя.
+        """Обрабатывает запрос на просмотр напоминаний чата.
 
         Args:
             update: Объект обновления Telegram
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
-        if not self.is_tg_user_allowed(user):
-            logger.warning(f"Попытка просмотра напоминаний от неразрешенного пользователя: {user.id}")
+        chat_id = update.effective_chat.id
+
+        if not self.is_chat_allowed(chat_id, user.id):
+            logger.warning(f"Попытка просмотра напоминаний от неразрешенного чата: {chat_id}")
             return
 
         try:
-            tasks = self.db.list_uncompleted_reminders(user.id)
+            tasks = self.db.list_uncompleted_reminders(chat_id)
 
             if not tasks:
-                await self.bot.send_message(user.id, "📋 У вас пока нет напоминаний")
+                await self.bot.send_message(chat_id, "📋 У вас пока нет напоминаний")
                 if update.callback_query:
                     await self.bot.answer_callback_query(update.callback_query.id)
                 return
@@ -1614,17 +1591,17 @@ class ReminderBot:
             ]
             reply_markup = InlineKeyboardMarkup(keyboard)
 
-            await self.bot.send_message(user.id, response, reply_markup=reply_markup)
+            await self.bot.send_message(chat_id, response, reply_markup=reply_markup)
             if update.callback_query:
                 await self.bot.answer_callback_query(update.callback_query.id)
 
-            logger.info(f"Пользователь {user.id} просмотрел свои напоминания")
+            logger.info(f"Чат {chat_id} просмотрел свои напоминания")
 
         except Exception as e:
             logger.error(f"Ошибка при просмотре напоминаний: {e}")
             error_message = "Произошла ошибка при получении списка напоминаний"
 
-            await self.bot.send_message(user.id, error_message)
+            await self.bot.send_message(chat_id, error_message)
             if update.callback_query:
                 await self.bot.answer_callback_query(update.callback_query.id, text="Произошла ошибка")
 
@@ -1636,10 +1613,14 @@ class ReminderBot:
             context: Контекст обработчика Telegram
         """
         user = update.effective_user
+        chat_id = update.effective_chat.id
+        is_group = chat_id < 0
+
         help_text = (
             "🤖 Привет! Я твой умный помощник в планировании.\n\n"
-            "Напиши мне, что и когда тебе нужно запланировать в свободном формате, "
-            "а я превращу твой запрос в структурированные напоминания.\n\n"
+            f"{'В этой группе' if is_group else 'В личном чате'} вы можете создавать напоминания, "
+            f"которые будут отправляться прямо сюда."
+            f"{' Любой участник группы может добавлять и управлять напоминаниями!' if is_group else ''}\n\n"
             "Основные команды:\n"
             "• /start - Начать работу с ботом\n"
             "• /help - Показать эту справку\n"
@@ -1648,15 +1629,15 @@ class ReminderBot:
             "• Напомни мне позвонить маме завтра\n"
             "• Купить молоко и хлеб по пути домой вечером\n"
             "• Запланируй встречу с клиентом в четверг в 15:00\n\n"
-            "Когда наступит время напоминания, я отправлю тебе уведомление и предложу варианты переноса задачи."
+            "Когда наступит время напоминания, я отправлю уведомление и предложу варианты переноса задачи."
         )
 
         try:
-            await self.bot.send_message(user.id, help_text)
+            await self.bot.send_message(chat_id, help_text)
             if update.callback_query:
                 await self.bot.answer_callback_query(update.callback_query.id)
 
-            logger.info(f"Пользователь {user.id} запросил справку")
+            logger.info(f"Чат {chat_id} запросил справку")
 
         except Exception as e:
             logger.error(f"Ошибка при отправке справки: {e}")
@@ -1679,9 +1660,9 @@ class ReminderBot:
 
             # Дополнительные команды для администраторов
             admin_commands = user_commands + [
-                BotCommand("allow", "Предоставить доступ пользователю"),
-                BotCommand("ban", "Отозвать доступ у пользователя"),
-                BotCommand("list", "Список пользователей"),
+                BotCommand("allow", "Предоставить доступ чату"),
+                BotCommand("ban", "Отозвать доступ у чата"),
+                BotCommand("list", "Список чатов"),
                 BotCommand("dbtasks", "Просмотр всех напоминаний"),
                 BotCommand("monitor", "Проверить состояние бота"),
                 BotCommand("getlog", "Получить журнал работы"),
@@ -1699,7 +1680,6 @@ class ReminderBot:
         except Exception as e:
             logger.error(f"Ошибка при установке команд бота: {e}")
 
-
 def main() -> None:
     """Основная функция запуска бота."""
     try:
@@ -1714,7 +1694,7 @@ def main() -> None:
         # Обработчики команд для администраторов
         application.add_handler(CommandHandler("allow", bot.allow))
         application.add_handler(CommandHandler("ban", bot.disallow))
-        application.add_handler(CommandHandler("list", bot.user_list))
+        application.add_handler(CommandHandler("list", bot.chat_list))  # Заменено на chat_list
         application.add_handler(CommandHandler("dbtasks", bot.db_tasks_list))
         application.add_handler(CommandHandler("monitor", bot.call_monitor))
         application.add_handler(CommandHandler("getlog", bot.call_get_log))
@@ -1728,9 +1708,8 @@ def main() -> None:
         application.add_handler(CallbackQueryHandler(bot.complete_task, pattern="^complete_task:"))
         application.add_handler(CallbackQueryHandler(bot.list_tags, pattern="^list_tags"))
         application.add_handler(CallbackQueryHandler(bot.list_tasks, pattern="^list_tasks"))
-        application.add_handler(CallbackQueryHandler(bot.user_get, pattern="^user_get:"))
-        application.add_handler(CallbackQueryHandler(bot.user_toggle, pattern="^user_toggle:"))
-        application.add_handler(CallbackQueryHandler(bot.user_admin, pattern="^user_admin:"))
+        application.add_handler(CallbackQueryHandler(bot.chat_get, pattern="^chat_get:"))  # Заменено на chat_get
+        application.add_handler(CallbackQueryHandler(bot.chat_toggle, pattern="^chat_toggle:"))  # Заменено на chat_toggle
         application.add_handler(CallbackQueryHandler(bot.db_tasks_navigation, pattern="^db_tasks_(prev|next)"))
         application.add_handler(CallbackQueryHandler(bot.help, pattern="^help"))
 

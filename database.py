@@ -7,7 +7,6 @@ from utils import *
 
 
 # Класс для работы с базой данных
-
 class Database:
     def __init__(self, db_name: str = "reminders.db"):
         self.conn = sqlite3.connect(db_name, check_same_thread=False)
@@ -16,170 +15,212 @@ class Database:
         logging.basicConfig(level=logging.INFO)
 
     def _create_tables(self):
-        with open('schema.sql') as f:
-            self.conn.executescript(f.read())
+        # Обновляем схему БД для работы с чатами
+        self.conn.executescript('''
+            -- Создаем таблицу для чатов, если она еще не существует
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id INTEGER PRIMARY KEY,
+                is_group BOOLEAN NOT NULL DEFAULT FALSE,
+                is_allowed BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Обновляем таблицу тегов (теперь они связаны с чатами, а не пользователями)
+            CREATE TABLE IF NOT EXISTS tags (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                FOREIGN KEY (chat_id) REFERENCES chats(chat_id),
+                UNIQUE(chat_id, name)
+            );
+
+            -- Обновляем таблицу для неподтвержденных напоминаний
+            CREATE TABLE IF NOT EXISTS pending_reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                created_by INTEGER,  -- ID пользователя, создавшего напоминание
+                text TEXT NOT NULL,
+                tag_id TEXT,
+                due_time REAL NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+            );
+
+            -- Обновляем таблицу для напоминаний
+            CREATE TABLE IF NOT EXISTS reminders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                created_by INTEGER,  -- ID пользователя, создавшего напоминание
+                text TEXT NOT NULL,
+                tag_id TEXT,
+                due_time REAL NOT NULL,
+                assist TEXT,
+                is_completed BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
+            );
+
+            -- Сохраняем таблицу для пользователей (для обратной совместимости)
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id INTEGER PRIMARY KEY,
+                full_name TEXT NOT NULL,
+                username TEXT,
+                is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+                is_allowed BOOLEAN NOT NULL DEFAULT FALSE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        ''')
         self.conn.commit()
 
-    # Users
-    def get_user(self, telegram_id: int) -> Optional[Dict]:
+    # Методы для работы с чатами
+    def get_chat(self, chat_id: int) -> Optional[Dict]:
         try:
             row = self.conn.execute(
-                "SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)
+                "SELECT * FROM chats WHERE chat_id = ?", (chat_id,)
             ).fetchone()
             return dict(row) if row else None
         except sqlite3.Error as e:
-            logging.error(f"Error getting user: {e}")
+            logging.error(f"Error getting chat: {e}")
             return None
 
-    def list_users(self) -> List[Dict]:
+    def list_chats(self) -> List[Dict]:
         try:
             rows = self.conn.execute(
-                "SELECT * FROM users"
+                "SELECT * FROM chats"
             ).fetchall()
             return [dict(row) for row in rows]
         except sqlite3.Error as e:
-            logging.error(f"Error getting user: {e}")
-            return None
+            logging.error(f"Error listing chats: {e}")
+            return []
 
-    def create_user(self, user_data: Dict) -> bool:
+    def create_chat(self, chat_data: Dict) -> bool:
         try:
             self.conn.execute(
-                """INSERT INTO users (telegram_id, full_name, username, is_admin, is_allowed)
-                   VALUES (?, ?, ?, ?, ?)""",
-                (user_data['telegram_id'], user_data['full_name'],
-                 user_data['username'], user_data.get('is_admin', False),
-                 user_data.get('is_allowed', False))
+                """INSERT INTO chats (chat_id, is_group, is_allowed)
+                   VALUES (?, ?, ?)""",
+                (chat_data['chat_id'], chat_data.get('is_group', False),
+                 chat_data.get('is_allowed', False))
             )
             self.conn.commit()
             return True
         except sqlite3.IntegrityError:
-            logging.warning("User already exists")
+            logging.warning("Chat already exists")
             return False
         except sqlite3.Error as e:
-            logging.error(f"Error creating user: {e}")
+            logging.error(f"Error creating chat: {e}")
             return False
 
-    def update_user_permission(self, telegram_id: int, is_allowed: bool) -> bool:
+    def update_chat_permission(self, chat_id: int, is_allowed: bool) -> bool:
         try:
             self.conn.execute(
-                "UPDATE users SET is_allowed = ? WHERE telegram_id = ?",
-                (is_allowed, telegram_id)
+                "UPDATE chats SET is_allowed = ? WHERE chat_id = ?",
+                (is_allowed, chat_id)
             )
             self.conn.commit()
             return True
         except sqlite3.Error as e:
-            logging.error(f"Error updating user permission: {e}")
+            logging.error(f"Error updating chat permission: {e}")
             return False
 
-    # def update_user_timezone(self, telegram_id: int, timezone: int) -> bool:
-    #     try:
-    #         self.conn.execute(
-    #             "UPDATE users SET timezone = ? WHERE telegram_id = ?",
-    #             (timezone, telegram_id)
-    #         )
-    #         self.conn.commit()
-    #         return True
-    #     except sqlite3.Error as e:
-    #         logging.error(f"Error updating user timezone: {e}")
-    #         return False
-
-    # Tags
-    def create_tag(self, user_id: int, name: str, start_time: str, end_time: str) -> bool:
+    # Теги - теперь привязаны к чатам
+    def create_tag(self, chat_id: int, name: str, start_time: str, end_time: str) -> bool:
         try:
             self.conn.execute(
-                """INSERT INTO tags (user_id, name, start_time, end_time)
+                """INSERT INTO tags (chat_id, name, start_time, end_time)
                    VALUES (?, ?, ?, ?)""",
-                (user_id, name, start_time, end_time)
+                (chat_id, name, start_time, end_time)
             )
             self.conn.commit()
             return True
         except sqlite3.IntegrityError as e:
-            logging.warning(f"Tag already exists for user: {e}")
+            logging.warning(f"Tag already exists for chat: {e}")
             return False
         except sqlite3.Error as e:
             logging.error(f"Error creating tag: {e}")
             return False
 
-    def get_user_tags(self, user_id: int) -> List[Dict]:
+    def get_chat_tags(self, chat_id: int) -> List[Dict]:
         try:
             rows = self.conn.execute(
-                "SELECT * FROM tags WHERE user_id = ?", (user_id,)
+                "SELECT * FROM tags WHERE chat_id = ?", (chat_id,)
             ).fetchall()
             return [dict(row) for row in rows]
         except sqlite3.Error as e:
-            logging.error(f"Error getting user tags: {e}")
+            logging.error(f"Error getting chat tags: {e}")
             return []
 
-    # Reminders
-    def create_unconfirmed_reminder(self, user_id: int, text: str, due_time: datetime, tag_id: Optional[int] = None) -> bool:
+    # Напоминания
+    def create_unconfirmed_reminder(self, chat_id: int, text: str, due_time: datetime,
+                                    created_by: int = None, tag_id: Optional[int] = None) -> bool:
         try:
             self.conn.execute(
-                """INSERT INTO pending_reminders (user_id, text, tag_id, due_time)
-                   VALUES (?, ?, ?, ?)""",
-                (user_id, text, tag_id, due_time.timestamp())
+                """INSERT INTO pending_reminders (chat_id, created_by, text, tag_id, due_time)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (chat_id, created_by, text, tag_id, due_time.timestamp())
             )
             self.conn.commit()
             return True
         except sqlite3.Error as e:
-            logging.error(f"Error create_unconfirmed_reminder reminder: {e}")
+            logging.error(f"Error creating unconfirmed reminder: {e}")
             return False
 
-    # Reminders
-    def list_unconfirmed_reminders(self, user_id: int) -> List[Dict]:
+    def list_unconfirmed_reminders(self, chat_id: int) -> List[Dict]:
         try:
             rows = self.conn.execute(
-                """SELECT * FROM pending_reminders where user_id=?""",
-                (user_id,)
+                """SELECT * FROM pending_reminders WHERE chat_id=?""",
+                (chat_id,)
             ).fetchall()
             return [dict(row) for row in rows]
         except sqlite3.Error as e:
-            logging.error(f"Error list_unconfirmed_reminders reminder: {e}")
-            return False
+            logging.error(f"Error listing unconfirmed reminders: {e}")
+            return []
 
-    def delete_unconfirmed_reminders(self, user_id: int):
+    def delete_unconfirmed_reminders(self, chat_id: int):
         try:
             count = self.conn.execute(
-                """DELETE FROM pending_reminders where user_id=?""",
-                (user_id,)
+                """DELETE FROM pending_reminders WHERE chat_id=?""",
+                (chat_id,)
             ).rowcount
             self.conn.commit()
             return count
         except sqlite3.Error as e:
-            logging.error(f"Error delete_unconfirmed_reminders reminder: {e}")
-            return False
+            logging.error(f"Error deleting unconfirmed reminders: {e}")
+            return 0
 
     def delete_unconfirmed_reminder(self, task_id: str):
         try:
             self.conn.execute(
-                """DELETE FROM pending_reminders where id=?""",
+                """DELETE FROM pending_reminders WHERE id=?""",
                 (task_id,)
             )
             self.conn.commit()
             return True
         except sqlite3.Error as e:
-            logging.error(f"Error delete_unconfirmed_reminder reminder: {e}")
+            logging.error(f"Error deleting unconfirmed reminder: {e}")
             return False
 
     def get_unconfirmed_reminder(self, task_id: str) -> Dict:
         try:
             row = self.conn.execute(
-                """SELECT * FROM pending_reminders where id=?""",
+                """SELECT * FROM pending_reminders WHERE id=?""",
                 (task_id,)
             ).fetchone()
-            return dict(row)
+            return dict(row) if row else {}
         except sqlite3.Error as e:
-            logging.error(f"Error get_unconfirmed_reminder reminder: {e}")
+            logging.error(f"Error getting unconfirmed reminder: {e}")
             return {}
 
     def get_reminder(self, task_id: str) -> Dict:
         try:
             row = self.conn.execute(
-                """SELECT * FROM reminders where id=?""",
+                """SELECT * FROM reminders WHERE id=?""",
                 (task_id,)
             ).fetchone()
-            return dict(row)
+            return dict(row) if row else {}
         except sqlite3.Error as e:
-            logging.error(f"Error get_reminder reminder: {e}")
+            logging.error(f"Error getting reminder: {e}")
             return {}
 
     def reschedule(self, task_id: str, new_due_time: datetime) -> bool:
@@ -191,18 +232,16 @@ class Database:
             self.conn.commit()
             return True
         except sqlite3.Error as e:
-            logging.error(f"Error reschedule reminder: {e}")
+            logging.error(f"Error rescheduling reminder: {e}")
             return False
 
-
-
-    # Reminders
-    def create_reminder(self, user_id: int, text: str, due_time: datetime, tag_id: Optional[int] = None) -> bool:
+    def create_reminder(self, chat_id: int, text: str, due_time: datetime,
+                        created_by: int = None, tag_id: Optional[int] = None) -> bool:
         try:
             self.conn.execute(
-                """INSERT INTO reminders (user_id, text, tag_id, due_time)
-                   VALUES (?, ?, ?, ?)""",
-                (user_id, text, tag_id, due_time.timestamp())
+                """INSERT INTO reminders (chat_id, created_by, text, tag_id, due_time)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (chat_id, created_by, text, tag_id, due_time.timestamp())
             )
             self.conn.commit()
             return True
@@ -210,7 +249,6 @@ class Database:
             logging.error(f"Error creating reminder: {e}")
             return False
 
-    # Reminders
     def mark_reminder_completed(self, task_id: int) -> bool:
         try:
             self.conn.execute(
@@ -220,30 +258,28 @@ class Database:
             self.conn.commit()
             return True
         except sqlite3.Error as e:
-            logging.error(f"Error mark_reminder_completed reminder: {e}")
+            logging.error(f"Error marking reminder as completed: {e}")
             return False
 
-    # Reminders
-    def list_uncompleted_reminders(self, user_id: int) -> List[Dict]:
+    def list_uncompleted_reminders(self, chat_id: int) -> List[Dict]:
         try:
             rows = self.conn.execute(
-                "SELECT * FROM reminders WHERE is_completed = FALSE and user_id=? ORDER BY due_time ASC", (user_id,)
+                "SELECT * FROM reminders WHERE is_completed = FALSE AND chat_id=? ORDER BY due_time ASC", (chat_id,)
             ).fetchall()
             return [dict(row) for row in rows]
         except sqlite3.Error as e:
-            logging.error(f"Error listing reminder: {e}")
-            return False
+            logging.error(f"Error listing reminders: {e}")
+            return []
 
-    # Reminders
-    def list_reminders_by_tag(self, user_id: int, tag_id: str) -> List[Dict]:
+    def list_reminders_by_tag(self, chat_id: int, tag_id: str) -> List[Dict]:
         try:
             rows = self.conn.execute(
-                "SELECT * FROM reminders WHERE user_id=? and tag_id=?", (user_id, tag_id)
+                "SELECT * FROM reminders WHERE chat_id=? AND tag_id=?", (chat_id, tag_id)
             ).fetchall()
             return [dict(row) for row in rows]
         except sqlite3.Error as e:
-            logging.error(f"Error listing reminder: {e}")
-            return False
+            logging.error(f"Error listing reminders by tag: {e}")
+            return []
 
     def get_due_reminders(self, dt: datetime) -> List[Dict]:
         try:
@@ -267,31 +303,7 @@ class Database:
             logging.error(f"Error updating assist: {e}")
             return False
 
-    # Admin functions
-    def add_pending_user(self, telegram_id: int, full_name: str, username: str) -> bool:
-        try:
-            self.conn.execute(
-                """INSERT OR REPLACE INTO pending_users (telegram_id, full_name, username)
-                   VALUES (?, ?, ?)""",
-                (telegram_id, full_name, username)
-            )
-            self.conn.commit()
-            return True
-        except sqlite3.Error as e:
-            logging.error(f"Error adding pending user: {e}")
-            return False
-
-    def get_pending_users(self) -> List[Dict]:
-        try:
-            rows = self.conn.execute(
-                "SELECT * FROM pending_users"
-            ).fetchall()
-            return [dict(row) for row in rows]
-        except sqlite3.Error as e:
-            logging.error(f"Error getting pending users: {e}")
-            return []
-
-    # ... другие методы для CRUD операций
+    # Остальные методы для обратной совместимости...
 
     def close(self):
         self.conn.close()
