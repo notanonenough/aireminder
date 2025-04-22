@@ -7,7 +7,7 @@ TARGET_TAG=$1
 # SSH options
 VM_USER=$2
 VM_HOST=$3
-PROJECT_PATH="/opt/aireminder"
+PROJECT_PATH="/opt/aireminder-chat"
 
 # Выполняем команды на VM через SSH
 ssh $VM_USER@$VM_HOST << EOF
