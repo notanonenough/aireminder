@@ -545,6 +545,10 @@ class ReminderBot:
                         )
                         logger.info(f"Откреплено перенесенное напоминание {task_id}")
                 except Exception as e:
+                    await self.bot.send_message(
+                        chat_id=chat_id,
+                        text="❌ ОШИБКА: не удалось открепить сообщение. Пожалуйста, открепите его самостоятельно чтобы не запутаться ❗",
+                    )
                     logger.error(f"Не удалось открепить сообщение при переносе: {e}")
 
                 # Обновляем сообщение с информацией о переносе
@@ -665,6 +669,10 @@ class ReminderBot:
                                 self.db.update_reminder_message_id(reminder['id'], message.message_id)
                                 logger.info(f"Закреплено напоминание {reminder['id']} в чате {chat_id}")
                             except Exception as e:
+                                await self.bot.send_message(
+                                    chat_id=chat_id,
+                                    text="❌ ОШИБКА: не удалось закрепить сообщение. Пожалуйста, закрепите его самостоятельно чтобы не потерять ❗",
+                                )
                                 logger.error(f"Не удалось закрепить сообщение: {e}")
 
                             # Отмечаем напоминание как отправленное
@@ -749,6 +757,10 @@ class ReminderBot:
                         )
                         logger.info(f"Откреплено сообщение с напоминанием {task_id}")
                 except Exception as e:
+                    await self.bot.send_message(
+                        chat_id=chat_id,
+                        text="❌ ОШИБКА: не удалось открепить сообщение. Пожалуйста, открепите его самостоятельно чтобы не запутаться ❗",
+                    )
                     logger.error(f"Не удалось открепить сообщение: {e}")
 
                 await self.bot.answer_callback_query(query.id, text="Задача отмечена как выполненная")
