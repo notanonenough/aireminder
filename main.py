@@ -511,27 +511,15 @@ class ReminderBot:
             await self.bot.answer_callback_query(query.id, text="Произошла ошибка")
 
     async def reschedule_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обрабатывает запрос на перенос напоминания.
-
-        Args:
-            update: Объект обновления Telegram
-            context: Контекст обработчика Telegram
-        """
+        """Обрабатывает запрос на перенос напоминания."""
         user = update.effective_user
         chat_id = update.effective_chat.id
 
         if not self.is_chat_allowed(chat_id, user.id):
-            logger.warning(f"Попытка переноса задачи от неразрешенного чата: {chat_id}")
             return
 
         query = update.callback_query
         parts = query.data.split(":")
-
-        if len(parts) < 3:
-            logger.error(f"Некорректный формат callback_data: {query.data}")
-            await self.bot.answer_callback_query(query.id, text="Некорректный формат запроса")
-            return
-
         task_id = parts[1]
         reschedule_delta = parts[2]
 
@@ -541,14 +529,25 @@ class ReminderBot:
             task_data = self.db.get_reminder(task_id)
 
             if not task_data:
-                logger.warning(f"Попытка перенести несуществующее напоминание: {task_id}")
                 await self.bot.answer_callback_query(query.id, text="Напоминание не найдено")
                 return
 
             new_due_dt = datetime.now(SERVER_TIMEZONE) + delta
 
             if self.db.reschedule(task_id, new_due_dt):
-                # Обновляем сообщение, добавляя информацию о переносе
+                # Открепляем текущее сообщение, так как задача перенесена
+                try:
+                    message_id = task_data.get('message_id')
+                    if message_id:
+                        await self.bot.unpin_chat_message(
+                            chat_id=chat_id,
+                            message_id=message_id
+                        )
+                        logger.info(f"Откреплено перенесенное напоминание {task_id}")
+                except Exception as e:
+                    logger.error(f"Не удалось открепить сообщение при переносе: {e}")
+
+                # Обновляем сообщение с информацией о переносе
                 if query.message:
                     try:
                         new_text = f"{query.message.text}\n\n⏰ Перенесено на {short_format_datetime(new_due_dt)}"
@@ -560,8 +559,7 @@ class ReminderBot:
                     chat_id,
                     f"⏰ Задача «{task_data['text']}» перенесена на {short_format_datetime(new_due_dt)}!"
                 )
-                logger.info(
-                    f"Пользователь {user.id} перенес задачу '{task_data['text']}' на {new_due_dt} в чате {chat_id}")
+                logger.info(f"Пользователь {user.id} перенес задачу на {new_due_dt}")
             else:
                 await self.bot.send_message(chat_id, "❌ Не удалось перенести задачу")
 
@@ -609,11 +607,7 @@ class ReminderBot:
         return timedelta(minutes=30)
 
     async def check_reminders(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Проверяет и отправляет напоминания, для которых наступило время.
-
-        Args:
-            context: Контекст планировщика
-        """
+        """Проверяет и отправляет напоминания, для которых наступило время."""
         dt = datetime.now(SERVER_TIMEZONE)
         try:
             reminders = self.db.get_due_reminders(dt)
@@ -639,9 +633,6 @@ class ReminderBot:
 
                         # Проверка, не отправляем напоминание раньше времени
                         if reminder_time > dt:
-                            err_message = f"Попытка отправить напоминание {reminder['id']} раньше времени: {reminder_time} > {dt}"
-                            logger.error(err_message)
-                            await self.bot.send_message(chat_id=ADMIN_ID, text=err_message)
                             continue
 
                         try:
@@ -654,12 +645,27 @@ class ReminderBot:
                             keyboard = self._create_reschedule_keyboard(reminder["id"])
                             reply_markup = InlineKeyboardMarkup(keyboard)
 
-                            # Отправка напоминания в чат, где оно было создано
-                            await self.bot.send_message(
+                            # Отправка напоминания в чат
+                            reminder_message = f"⏰ *Напоминание:* {reminder['text']}{assist}"
+                            message = await self.bot.send_message(
                                 chat_id=chat_id,
-                                text=f"⏰ Напоминание: {reminder['text']}{assist}",
-                                reply_markup=reply_markup
+                                text=reminder_message,
+                                reply_markup=reply_markup,
+                                parse_mode='Markdown'
                             )
+
+                            # Закрепляем сообщение с напоминанием
+                            try:
+                                await self.bot.pin_chat_message(
+                                    chat_id=chat_id,
+                                    message_id=message.message_id,
+                                    disable_notification=False
+                                )
+                                # Сохраняем ID сообщения в БД для будущей открепки
+                                self.db.update_reminder_message_id(reminder['id'], message.message_id)
+                                logger.info(f"Закреплено напоминание {reminder['id']} в чате {chat_id}")
+                            except Exception as e:
+                                logger.error(f"Не удалось закрепить сообщение: {e}")
 
                             # Отмечаем напоминание как отправленное
                             self.db.mark_reminder_completed(reminder['id'])
@@ -705,17 +711,11 @@ class ReminderBot:
         ]
 
     async def complete_task(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Обрабатывает отметку задачи как выполненной.
-
-        Args:
-            update: Объект обновления Telegram
-            context: Контекст обработчика Telegram
-        """
+        """Обрабатывает отметку задачи как выполненной."""
         user = update.effective_user
         chat_id = update.effective_chat.id
 
         if not self.is_chat_allowed(chat_id, user.id):
-            logger.warning(f"Попытка отметки задачи от неразрешенного чата: {chat_id}")
             return
 
         query = update.callback_query
@@ -724,7 +724,6 @@ class ReminderBot:
         try:
             task_data = self.db.get_reminder(task_id)
             if not task_data:
-                logger.warning(f"Попытка отметить несуществующее напоминание: {task_id}")
                 await self.bot.answer_callback_query(query.id, text="Напоминание не найдено")
                 return
 
@@ -737,9 +736,23 @@ class ReminderBot:
                     except Exception as e:
                         logger.error(f"Не удалось обновить сообщение: {e}")
 
+                # Открепляем сообщение
+                try:
+                    # Проверяем, есть ли ID сообщения в данных задачи
+                    message_id = task_data.get('message_id')
+
+                    if message_id:
+                        # Открепляем сообщение
+                        await self.bot.unpin_chat_message(
+                            chat_id=chat_id,
+                            message_id=message_id
+                        )
+                        logger.info(f"Откреплено сообщение с напоминанием {task_id}")
+                except Exception as e:
+                    logger.error(f"Не удалось открепить сообщение: {e}")
+
                 await self.bot.answer_callback_query(query.id, text="Задача отмечена как выполненная")
-                logger.info(
-                    f"Пользователь {user.id} отметил задачу '{task_data['text']}' как выполненную в чате {chat_id}")
+                logger.info(f"Пользователь {user.id} отметил задачу '{task_data['text']}' как выполненную")
             else:
                 await self.bot.answer_callback_query(query.id, text="Не удалось обновить статус задачи")
 

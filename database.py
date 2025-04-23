@@ -57,6 +57,7 @@ class Database:
                 tag_id TEXT,
                 due_time REAL NOT NULL,
                 assist TEXT,
+                message_id INTEGER DEFAULT NULL,
                 is_completed BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (chat_id) REFERENCES chats(chat_id)
@@ -71,6 +72,10 @@ class Database:
                 is_allowed BOOLEAN NOT NULL DEFAULT FALSE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+        ''')
+        self.conn.executescript('''
+            -- Добавляем поле message_id в таблицу напоминаний
+            ALTER TABLE reminders ADD COLUMN message_id INTEGER DEFAULT NULL;
         ''')
         self.conn.commit()
 
@@ -303,7 +308,18 @@ class Database:
             logging.error(f"Error updating assist: {e}")
             return False
 
-    # Остальные методы для обратной совместимости...
+    def update_reminder_message_id(self, reminder_id: int, message_id: int) -> bool:
+        """Сохраняет ID сообщения напоминания для последующего открепления."""
+        try:
+            self.conn.execute(
+                """UPDATE reminders SET message_id = ? WHERE id = ?""",
+                (message_id, reminder_id)
+            )
+            self.conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logging.error(f"Error updating reminder message_id: {e}")
+            return False
 
     def close(self):
         self.conn.close()
