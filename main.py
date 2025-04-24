@@ -282,6 +282,19 @@ class ReminderBot:
             logger.error(f"Ошибка при планировании задач через LLM: {e}")
             raise
 
+    async def handle_chat_migration(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Обрабатывает миграцию чата из группы в супергруппу."""
+        if update.message and update.message.migrate_to_chat_id:
+            old_chat_id = update.effective_chat.id
+            new_chat_id = update.message.migrate_to_chat_id
+
+            logger.info(f"Обнаружена миграция чата {old_chat_id} -> {new_chat_id}")
+
+            if self.db.update_chat_id(old_chat_id, new_chat_id):
+                logger.info(f"ID чата успешно обновлен в базе данных")
+            else:
+                logger.error(f"Не удалось обновить ID чата в базе данных")
+
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Обрабатывает текстовые сообщения пользователя.
 
@@ -651,12 +664,30 @@ class ReminderBot:
 
                             # Отправка напоминания в чат
                             reminder_message = f"⏰ *Напоминание:* {reminder['text']}{assist}"
-                            message = await self.bot.send_message(
-                                chat_id=chat_id,
-                                text=reminder_message,
-                                reply_markup=reply_markup,
-                                parse_mode='Markdown'
-                            )
+                            try:
+                                message = await self.bot.send_message(
+                                    chat_id=chat_id,
+                                    text=reminder_message,
+                                    reply_markup=reply_markup,
+                                    parse_mode='Markdown'
+                                )
+                            except telegram.error.ChatMigrated as e:
+                                # Обрабатываем миграцию чата
+                                new_chat_id = e.new_chat_id
+                                logger.info(f"Обнаружена миграция чата {chat_id} -> {new_chat_id}")
+
+                                if self.db.update_chat_id(chat_id, new_chat_id):
+                                    logger.info("ID чата успешно обновлен, повторная попытка отправки")
+                                    # Повторная попытка отправки в новый чат
+                                    message = await self.bot.send_message(
+                                        chat_id=new_chat_id,
+                                        text=reminder_message,
+                                        reply_markup=reply_markup,
+                                        parse_mode='Markdown'
+                                    )
+                                else:
+                                    logger.error("Не удалось обновить ID чата")
+
 
                             # Закрепляем сообщение с напоминанием
                             try:
@@ -1726,6 +1757,7 @@ def main() -> None:
         application.add_handler(CommandHandler("clearlog", bot.call_clear_log))
 
         # Обработчики сообщений и коллбэков
+        application.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, bot.handle_chat_migration))
         application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
         application.add_handler(CallbackQueryHandler(bot.ignore, pattern="^ignore"))
         application.add_handler(CallbackQueryHandler(bot.confirm_task, pattern="^confirm_task:"))

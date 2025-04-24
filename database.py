@@ -304,6 +304,33 @@ class Database:
             logging.error(f"Error updating assist: {e}")
             return False
 
+    def update_chat_id(self, old_chat_id: int, new_chat_id: int) -> bool:
+        """Обновляет ID чата после миграции из группы в супергруппу."""
+        try:
+            # Транзакция для обеспечения целостности данных
+            with self.conn:
+                # Обновляем ID во всех связанных таблицах
+                self.conn.execute(
+                    "UPDATE chats SET chat_id = ? WHERE chat_id = ?",
+                    (new_chat_id, old_chat_id)
+                )
+                self.conn.execute(
+                    "UPDATE reminders SET chat_id = ? WHERE chat_id = ?",
+                    (new_chat_id, old_chat_id)
+                )
+                self.conn.execute(
+                    "UPDATE pending_reminders SET chat_id = ? WHERE chat_id = ?",
+                    (new_chat_id, old_chat_id)
+                )
+                self.conn.execute(
+                    "UPDATE tags SET chat_id = ? WHERE chat_id = ?",
+                    (new_chat_id, old_chat_id)
+                )
+            return True
+        except sqlite3.Error as e:
+            logging.error(f"Error updating chat ID: {e}")
+            return False
+
     def update_reminder_message_id(self, reminder_id: int, message_id: int) -> bool:
         """Сохраняет ID сообщения напоминания для последующего открепления."""
         try:
